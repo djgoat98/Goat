@@ -2,32 +2,53 @@
 
 import os
 from typing import Optional
-from dotenv import load_dotenv
 
-load_dotenv()
+import keyring
+
+from .config import (
+    ENV_RH_USERNAME, ENV_RH_PASSWORD, ENV_RH_MFA,
+    KEYRING_SERVICE, KEYRING_RH_USER, KEYRING_RH_PASS,
+)
+from .exceptions import MissingCredentialsError, RobinhoodAuthError, RobinhoodDataError
 
 
-def _get_credentials() -> tuple[str, str]:
-    username = os.getenv("ROBINHOOD_USERNAME", "")
-    password = os.getenv("ROBINHOOD_PASSWORD", "")
+def get_credentials() -> tuple[str, str]:
+    """Resolve Robinhood credentials: env vars first, then keyring."""
+    username = os.environ.get(ENV_RH_USERNAME) or keyring.get_password(KEYRING_SERVICE, KEYRING_RH_USER)
+    password = os.environ.get(ENV_RH_PASSWORD) or keyring.get_password(KEYRING_SERVICE, KEYRING_RH_PASS)
     if not username or not password:
-        raise ValueError(
-            "Set ROBINHOOD_USERNAME and ROBINHOOD_PASSWORD in your .env file "
-            "or environment variables."
+        raise MissingCredentialsError(
+            f"Robinhood credentials not found.\n"
+            f"Set {ENV_RH_USERNAME} and {ENV_RH_PASSWORD} as environment variables,\n"
+            f"or run `goat connect --save-keyring` after setting them once."
         )
     return username, password
 
 
-def login() -> bool:
-    """Log in to Robinhood. Returns True on success."""
+def save_to_keyring(username: str, password: str) -> None:
+    keyring.set_password(KEYRING_SERVICE, KEYRING_RH_USER, username)
+    keyring.set_password(KEYRING_SERVICE, KEYRING_RH_PASS, password)
+
+
+def clear_keyring() -> None:
+    for key in (KEYRING_RH_USER, KEYRING_RH_PASS):
+        try:
+            keyring.delete_password(KEYRING_SERVICE, key)
+        except keyring.errors.PasswordDeleteError:
+            pass
+
+
+def login() -> None:
+    """Log in to Robinhood. Session token cached by robin_stocks."""
     try:
         import robin_stocks.robinhood as rh
-        username, password = _get_credentials()
-        mfa = os.getenv("ROBINHOOD_MFA", None) or None
+        username, password = get_credentials()
+        mfa = os.environ.get(ENV_RH_MFA) or None
         rh.login(username, password, mfa_code=mfa, store_session=True)
-        return True
+    except MissingCredentialsError:
+        raise
     except Exception as e:
-        raise RuntimeError(f"Robinhood login failed: {e}") from e
+        raise RobinhoodAuthError(f"Robinhood login failed: {e}") from e
 
 
 def logout() -> None:
@@ -39,66 +60,52 @@ def logout() -> None:
 
 
 def get_portfolio_value() -> dict:
-    """Return total portfolio value and equity breakdown."""
-    import robin_stocks.robinhood as rh
-    profile = rh.load_portfolio_profile()
-    return {
-        "equity": float(profile.get("equity") or 0),
-        "extended_hours_equity": float(profile.get("extended_hours_equity") or 0),
-        "market_value": float(profile.get("market_value") or 0),
-        "withdrawable_amount": float(profile.get("withdrawable_amount") or 0),
-    }
+    try:
+        import robin_stocks.robinhood as rh
+        profile = rh.load_portfolio_profile()
+        return {
+            "equity": float(profile.get("equity") or 0),
+            "extended_hours_equity": float(profile.get("extended_hours_equity") or 0),
+            "market_value": float(profile.get("market_value") or 0),
+            "withdrawable_amount": float(profile.get("withdrawable_amount") or 0),
+        }
+    except Exception as e:
+        raise RobinhoodDataError(f"Failed to load portfolio profile: {e}") from e
 
 
 def get_holdings() -> list[dict]:
-    """Return current stock/ETF holdings with quantity, price, and gain."""
-    import robin_stocks.robinhood as rh
-    raw = rh.build_holdings()
-    holdings = []
-    for ticker, data in raw.items():
-        holdings.append({
-            "ticker": ticker,
-            "name": data.get("name", ticker),
-            "quantity": float(data.get("quantity", 0)),
-            "average_buy_price": float(data.get("average_buy_price", 0)),
-            "current_price": float(data.get("price", 0)),
-            "equity": float(data.get("equity", 0)),
-            "percent_change": float(data.get("percentage", 0)),
-            "equity_change": float(data.get("equity_change", 0)),
-            "type": data.get("type", "stock"),
-            "pe_ratio": data.get("pe_ratio"),
-        })
-    return sorted(holdings, key=lambda x: x["equity"], reverse=True)
-
-
-def get_dividends() -> list[dict]:
-    """Return dividend payment history (last 20 entries)."""
-    import robin_stocks.robinhood as rh
-    raw = rh.get_dividends()
-    dividends = []
-    for d in (raw or [])[:20]:
-        dividends.append({
-            "ticker": d.get("instrument", ""),
-            "amount": float(d.get("amount") or 0),
-            "paid_at": d.get("paid_at", ""),
-            "state": d.get("state", ""),
-        })
-    return dividends
+    try:
+        import robin_stocks.robinhood as rh
+        raw = rh.build_holdings()
+        holdings = []
+        for ticker, data in raw.items():
+            holdings.append({
+                "ticker": ticker,
+                "name": data.get("name", ticker),
+                "quantity": float(data.get("quantity", 0)),
+                "average_buy_price": float(data.get("average_buy_price", 0)),
+                "current_price": float(data.get("price", 0)),
+                "equity": float(data.get("equity", 0)),
+                "percent_change": float(data.get("percentage", 0)),
+                "equity_change": float(data.get("equity_change", 0)),
+                "type": data.get("type", "stock"),
+                "pe_ratio": data.get("pe_ratio"),
+            })
+        return sorted(holdings, key=lambda x: x["equity"], reverse=True)
+    except Exception as e:
+        raise RobinhoodDataError(f"Failed to load holdings: {e}") from e
 
 
 def get_total_return() -> dict:
-    """Return total portfolio return metrics."""
-    import robin_stocks.robinhood as rh
     try:
+        import robin_stocks.robinhood as rh
         profile = rh.load_portfolio_profile()
         equity = float(profile.get("equity") or 0)
-        adjusted_equity = float(profile.get("adjusted_equity_previous_close") or equity)
+        adjusted = float(profile.get("adjusted_equity_previous_close") or equity)
         return {
             "equity": equity,
-            "daily_change": equity - adjusted_equity,
-            "daily_change_pct": ((equity - adjusted_equity) / adjusted_equity * 100)
-            if adjusted_equity
-            else 0,
+            "daily_change": equity - adjusted,
+            "daily_change_pct": ((equity - adjusted) / adjusted * 100) if adjusted else 0,
         }
     except Exception:
         return {"equity": 0, "daily_change": 0, "daily_change_pct": 0}

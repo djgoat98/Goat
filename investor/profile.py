@@ -2,12 +2,12 @@
 
 import json
 import os
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from typing import Optional
 
-PROFILE_DIR = Path.home() / ".goat"
-PROFILE_PATH = PROFILE_DIR / "profile.json"
+from .config import GOAT_DIR, PROFILE_PATH
+from .exceptions import ProfileNotFoundError
 
 
 @dataclass
@@ -20,12 +20,14 @@ class InvestorProfile:
     time_horizon_years: int
     age: Optional[int] = None
     notes: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def summary(self) -> str:
-        goals_str = ", ".join(self.goals)
+        goals_str = ", ".join(g.replace("_", " ") for g in self.goals)
         return (
             f"Investor: {self.name}\n"
             f"Risk: {self.risk_tolerance} | Goals: {goals_str}\n"
@@ -36,18 +38,31 @@ class InvestorProfile:
 
 
 def save_profile(profile: InvestorProfile) -> None:
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    GOAT_DIR.mkdir(parents=True, exist_ok=True)
+    existing = _load_raw()
+    if existing:
+        profile.created_at = existing.get("created_at", profile.created_at)
+    profile.updated_at = datetime.now().isoformat()
     with open(PROFILE_PATH, "w") as f:
         json.dump(profile.to_dict(), f, indent=2)
+    os.chmod(PROFILE_PATH, 0o600)
 
 
-def load_profile() -> Optional[InvestorProfile]:
-    if not PROFILE_PATH.exists():
-        return None
-    with open(PROFILE_PATH) as f:
-        data = json.load(f)
+def load_profile() -> InvestorProfile:
+    data = _load_raw()
+    if data is None:
+        raise ProfileNotFoundError(
+            "No investor profile found. Run `goat setup` to create one."
+        )
     return InvestorProfile(**data)
 
 
 def profile_exists() -> bool:
     return PROFILE_PATH.exists()
+
+
+def _load_raw() -> Optional[dict]:
+    if not PROFILE_PATH.exists():
+        return None
+    with open(PROFILE_PATH) as f:
+        return json.load(f)
